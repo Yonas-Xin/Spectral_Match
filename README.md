@@ -2,6 +2,8 @@
 
 `Spectral Match` 是一个本地运行的高光谱光谱匹配工具。前端基于 `React + Vite`，后端基于 `FastAPI`。项目支持加载本地高光谱影像，进行像元/区域光谱提取，与本地光谱库做匹配，并导出结果。
 
+![示例](./assets/figs/fig1.png)
+
 ## 目录说明
 
 ```text
@@ -61,17 +63,4 @@ npm install
 
 ```powershell
 python .\main.py
-```
-
-## GitHub 上传建议
-
-在确认 `.gitignore` 已放到仓库根目录后，再执行初始化和推送。
-
-```powershell
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin <你的 GitHub 仓库地址>
-git push -u origin main
 ```
