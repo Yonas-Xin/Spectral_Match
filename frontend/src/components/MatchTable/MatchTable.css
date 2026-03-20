@@ -1,0 +1,142 @@
+.match-table-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.match-export-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid rgba(15, 42, 61, 0.08);
+  background: rgba(248, 252, 255, 0.78);
+}
+
+.match-export-fields {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.match-export-select {
+  width: 76px;
+  min-width: 76px;
+  padding: 0.45rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(14, 116, 144, 0.24);
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 0.78rem;
+}
+
+.match-export-path {
+  flex: 1;
+  min-width: 0;
+  padding: 0.46rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid rgba(14, 116, 144, 0.24);
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 0.78rem;
+}
+
+.match-export-btn {
+  min-width: 126px;
+  font-size: 0.78rem;
+  padding: 0.45rem 0.7rem;
+}
+
+.table-wrapper {
+  overflow: auto;
+  flex: 1;
+}
+
+.match-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.83rem;
+}
+
+.match-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: rgba(245, 251, 255, 0.95);
+  padding: 0.72rem 0.7rem;
+  color: var(--text-secondary);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid rgba(15, 42, 61, 0.12);
+}
+
+.match-table td {
+  padding: 0.7rem 0.7rem;
+  border-bottom: 1px solid rgba(15, 42, 61, 0.07);
+}
+
+.match-table tr:hover td {
+  background: rgba(211, 239, 255, 0.32);
+}
+
+.rank-badge {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.77rem;
+  color: #0f766e;
+  border: 1px solid rgba(15, 118, 110, 0.32);
+  background: rgba(13, 148, 136, 0.14);
+}
+
+.class-chip-cell {
+  min-width: 7rem;
+}
+
+.class-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid rgba(14, 116, 144, 0.25);
+  background: rgba(14, 116, 144, 0.1);
+  color: #0f4c72;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.text-primary {
+  color: var(--text-primary);
+}
+
+.font-medium {
+  font-weight: 700;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.78rem;
+}
+
+.p-4 {
+  padding: 1rem;
+}
+
+@media (max-width: 1500px) {
+  .match-export-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .match-export-btn {
+    width: 100%;
+  }
+}

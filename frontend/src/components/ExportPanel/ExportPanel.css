@@ -1,0 +1,20 @@
+.export-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.export-controls.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.empty-state-text {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.mb-2 {
+  margin-bottom: 0.5rem;
+}
