@@ -1,6 +1,7 @@
 import React from 'react'
 import { Layout } from './components/Layout'
 import { ImageViewer } from './components/ImageViewer'
+import { LibrarySearchPanel } from './components/LibrarySearchPanel'
 import { SpectralChart } from './components/SpectralChart'
 import { MatchTable } from './components/MatchTable'
 import './App.css'
@@ -14,6 +15,7 @@ const App: React.FC = () => {
           <SpectralChart />
         </div>
         <div className="main-col right-col">
+          <LibrarySearchPanel />
           <MatchTable />
         </div>
       </div>

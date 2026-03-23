@@ -88,6 +88,7 @@ class PixelMatchRequest(BaseModel):
     return_candidate_curves: bool = True
     selection: RegionSelection | None = None
     custom_masked_ranges: list[SpectralMaskRange] = Field(default_factory=list)
+    candidate_spectrum_ids: list[int] = Field(default_factory=list)
 
 
 class SpectrumExtractRequest(BaseModel):
@@ -108,6 +109,7 @@ class ExportMatchResultRequest(BaseModel):
     ignore_water_bands: bool = True
     min_valid_bands: int | None = Field(default=None, ge=1)
     selection: RegionSelection | None = None
+    candidate_spectrum_ids: list[int] = Field(default_factory=list)
 
 
 class QuerySpectrumData(BaseModel):
@@ -150,6 +152,40 @@ class PixelMatchData(BaseModel):
     query: QuerySpectrumData
     match_context: MatchContextData
     results: list[MatchResultItem]
+
+
+class LibrarySpectrumSummary(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    spectrum_id: int
+    name: str
+    class_name: str | None = Field(default=None, alias="class")
+    sensor_type: str | None = None
+    measure_mode: str | None = None
+    source: str | None = None
+    chapter: str | None = None
+
+
+class LibrarySearchData(BaseModel):
+    query: str
+    total: int
+    items: list[LibrarySpectrumSummary]
+
+
+class LibraryCurvesRequest(BaseModel):
+    image_id: str
+    spectrum_ids: list[int] = Field(default_factory=list)
+
+
+class LibraryCurveItem(LibrarySpectrumSummary):
+    wavelengths: list[float]
+    curve: list[float]
+
+
+class LibraryCurvesData(BaseModel):
+    image_id: str
+    wavelengths: list[float]
+    items: list[LibraryCurveItem]
 
 
 class SpectrumExtractData(BaseModel):

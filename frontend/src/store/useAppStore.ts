@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { LibraryCurveItem, LibrarySearchItem, MatchData } from '../types/spectral'
 
 export type SelectionMode = 'pixel' | 'box' | 'circle' | 'lasso'
 
@@ -20,7 +21,9 @@ export interface AppState {
   signatureHash: string | null;
   status: 'idle' | 'loading_image' | 'building_cache' | 'ready' | 'error';
   errorMessage: string | null;
-  matchData: any | null;
+  matchData: MatchData | null;
+  selectedLibrarySpectra: LibrarySearchItem[];
+  selectedLibraryCurves: LibraryCurveItem[];
   matchOptions: {
     topN: number;
     metric: string;
@@ -41,7 +44,12 @@ export interface AppState {
   clearSelection: () => void;
   setStatus: (status: AppState['status'], errorMessage?: string | null) => void;
   setMatchOptions: (options: Partial<AppState['matchOptions']>) => void;
-  setMatchData: (data: any) => void;
+  setMatchData: (data: MatchData | null) => void;
+  toggleSelectedLibrarySpectrum: (item: LibrarySearchItem) => void;
+  addSelectedLibrarySpectra: (items: LibrarySearchItem[]) => void;
+  removeSelectedLibrarySpectra: (spectrumIds: number[]) => void;
+  clearSelectedLibrarySpectra: () => void;
+  setSelectedLibraryCurves: (items: LibraryCurveItem[]) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -57,6 +65,8 @@ export const useAppStore = create<AppState>((set) => ({
   status: 'idle',
   errorMessage: null,
   matchData: null,
+  selectedLibrarySpectra: [],
+  selectedLibraryCurves: [],
   matchOptions: {
     topN: 10,
     metric: 'sam',
@@ -78,7 +88,8 @@ export const useAppStore = create<AppState>((set) => ({
       selectionRevision: 0,
       status: 'ready',
       errorMessage: null,
-      matchData: null
+      matchData: null,
+      selectedLibraryCurves: []
     }),
     
   setSelectedPixel: (x, y) =>
@@ -113,5 +124,48 @@ export const useAppStore = create<AppState>((set) => ({
     matchOptions: { ...state.matchOptions, ...options }
   })),
 
-  setMatchData: (data: any) => set({ matchData: data })
+  setMatchData: (data) => set({ matchData: data }),
+
+  toggleSelectedLibrarySpectrum: (item) =>
+    set((state) => {
+      const exists = state.selectedLibrarySpectra.some((entry) => entry.spectrum_id === item.spectrum_id)
+      return {
+        selectedLibrarySpectra: exists
+          ? state.selectedLibrarySpectra.filter((entry) => entry.spectrum_id !== item.spectrum_id)
+          : [...state.selectedLibrarySpectra, item]
+      }
+    }),
+
+  addSelectedLibrarySpectra: (items) =>
+    set((state) => {
+      if (items.length === 0) {
+        return { selectedLibrarySpectra: state.selectedLibrarySpectra }
+      }
+      const byId = new Map(state.selectedLibrarySpectra.map((item) => [item.spectrum_id, item]))
+      items.forEach((item) => {
+        byId.set(item.spectrum_id, item)
+      })
+      return {
+        selectedLibrarySpectra: Array.from(byId.values())
+      }
+    }),
+
+  removeSelectedLibrarySpectra: (spectrumIds) =>
+    set((state) => {
+      if (spectrumIds.length === 0) {
+        return { selectedLibrarySpectra: state.selectedLibrarySpectra }
+      }
+      const removeSet = new Set(spectrumIds)
+      return {
+        selectedLibrarySpectra: state.selectedLibrarySpectra.filter((item) => !removeSet.has(item.spectrum_id))
+      }
+    }),
+
+  clearSelectedLibrarySpectra: () =>
+    set({
+      selectedLibrarySpectra: [],
+      selectedLibraryCurves: []
+    }),
+
+  setSelectedLibraryCurves: (items) => set({ selectedLibraryCurves: items })
 }))

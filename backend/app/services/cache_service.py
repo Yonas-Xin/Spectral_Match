@@ -160,6 +160,9 @@ class SignatureCacheService:
             return fwhm
         return self._estimate_fwhm_from_waves(img_waves)
 
+    def resolve_target_fwhm(self, img_waves: np.ndarray, img_fwhm: np.ndarray | None) -> np.ndarray:
+        return self._resolve_target_fwhm(img_waves=img_waves, img_fwhm=img_fwhm)
+
     @staticmethod
     def _build_gaussian_response_weights(
         lib_waves: np.ndarray,

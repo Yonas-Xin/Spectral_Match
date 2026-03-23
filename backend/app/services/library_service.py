@@ -10,6 +10,8 @@ import numpy as np
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.utils.library_meta import normalize_display_name, parse_variant_mode
+from app.utils.spectral_math import resample_gaussian_fwhm, resample_linear, sanitize_reflectance
 
 
 @dataclass
@@ -27,15 +29,24 @@ class SpectrumMeta:
     name: str
     class_name: str | None
     source: str | None
+    raw_name: str | None = None
     instrument_variant: str | None = None
     measure_mode: str | None = None
     chapter: str | None = None
+
+
+@dataclass
+class RawSpectrum:
+    spectrum_id: int
+    wavelengths: np.ndarray
+    values: np.ndarray
 
 
 class LibraryService:
     def __init__(self) -> None:
         self.h5_path = settings.library_h5_path
         self.sqlite_path = settings.library_sqlite_path
+        self._id_row_index: dict[int, int] | None = None
 
     def is_ready(self) -> bool:
         return self.h5_path.exists()
@@ -82,6 +93,80 @@ class LibraryService:
             return self._fetch_metadata_from_h5(ids)
         return {}
 
+    def search_metadata(self, query: str, limit: int = 20) -> tuple[int, list[SpectrumMeta]]:
+        if self.sqlite_path.exists():
+            return self._search_metadata_from_sqlite(query=query, limit=limit)
+        if self.h5_path.exists():
+            return self._search_metadata_from_h5(query=query, limit=limit)
+        raise AppError(
+            ErrorCode.LIBRARY_NOT_READY,
+            f"library metadata not found: {self.sqlite_path}",
+            status_code=500,
+        )
+
+    def load_raw_spectra(self, ids: list[int]) -> list[RawSpectrum]:
+        wanted = [int(sid) for sid in ids if int(sid) > 0]
+        if not wanted:
+            return []
+
+        id_row_index = self._load_id_row_index()
+        ordered_rows: list[tuple[int, int]] = []
+        for sid in wanted:
+            row_idx = id_row_index.get(sid)
+            if row_idx is not None:
+                ordered_rows.append((sid, row_idx))
+
+        if not ordered_rows:
+            return []
+
+        out: list[RawSpectrum] = []
+        with h5py.File(self.h5_path, "r") as h5:
+            raw_values = h5["/spectra/raw_values"]
+            raw_lengths = h5["/spectra/raw_lengths"][:].astype(np.int32)
+            raw_wave_start_idx = h5["/spectra/raw_wave_start_idx"][:].astype(np.int64)
+            all_waves = h5["/waves/all_waves"][:].astype(np.float32)
+
+            for sid, row_idx in ordered_rows:
+                length = int(raw_lengths[row_idx])
+                wave_start = int(raw_wave_start_idx[row_idx])
+                values = raw_values[row_idx, :length].astype(np.float32)
+                wavelengths = all_waves[wave_start : wave_start + length].astype(np.float32, copy=False)
+                out.append(
+                    RawSpectrum(
+                        spectrum_id=sid,
+                        wavelengths=wavelengths.copy(),
+                        values=values,
+                    )
+                )
+
+        return out
+
+    def load_resampled_spectra(
+        self,
+        ids: list[int],
+        target_waves: np.ndarray,
+        target_fwhm: np.ndarray | None = None,
+    ) -> dict[int, np.ndarray]:
+        target = np.asarray(target_waves, dtype=np.float32)
+        if target.size == 0:
+            return {}
+
+        use_gaussian = target_fwhm is not None
+        fwhm = np.asarray(target_fwhm, dtype=np.float32) if target_fwhm is not None else None
+
+        out: dict[int, np.ndarray] = {}
+        for raw in self.load_raw_spectra(ids):
+            if use_gaussian and fwhm is not None:
+                resampled = resample_gaussian_fwhm(raw.wavelengths, raw.values, target, fwhm)
+            else:
+                resampled = resample_linear(raw.wavelengths, raw.values, target)
+            out[raw.spectrum_id] = sanitize_reflectance(
+                resampled,
+                clip_min=settings.clip_reflectance_min,
+                clip_max=settings.clip_reflectance_max,
+            )
+        return out
+
     def _fetch_metadata_from_sqlite(self, ids: list[int]) -> dict[int, SpectrumMeta]:
         with sqlite3.connect(self.sqlite_path) as conn:
             columns = {
@@ -90,9 +175,12 @@ class LibraryService:
             }
 
         select_cols = ["id", "name", "class", "source"]
+        has_raw_name = "raw_name" in columns
         has_variant = "instrument_variant" in columns
         has_mode = "measure_mode" in columns
         has_chapter = "chapter" in columns
+        if has_raw_name:
+            select_cols.append("raw_name")
         if has_variant:
             select_cols.append("instrument_variant")
         if has_mode:
@@ -118,6 +206,7 @@ class LibraryService:
                     name=str(row["name"]),
                     class_name=str(row["class"]) if row["class"] is not None else None,
                     source=str(row["source"]) if row["source"] is not None else None,
+                    raw_name=(str(row["raw_name"]) if has_raw_name and row["raw_name"] is not None else None),
                     instrument_variant=(
                         str(row["instrument_variant"]) if has_variant and row["instrument_variant"] is not None else None
                     ),
@@ -144,6 +233,7 @@ class LibraryService:
                         name=f"Spectrum {sid}",
                         class_name=None,
                         source=None,
+                        raw_name=None,
                         instrument_variant=None,
                         measure_mode=None,
                         chapter=None,
@@ -167,6 +257,7 @@ class LibraryService:
                         name=f"Spectrum {sid}",
                         class_name=None,
                         source=None,
+                        raw_name=None,
                         instrument_variant=None,
                         measure_mode=None,
                         chapter=None,
@@ -183,11 +274,136 @@ class LibraryService:
                     name=name,
                     class_name=class_name,
                     source=source,
+                    raw_name=None,
                     instrument_variant=None,
                     measure_mode=None,
                     chapter=None,
                 )
         return out
+
+    def _search_metadata_from_sqlite(self, query: str, limit: int) -> tuple[int, list[SpectrumMeta]]:
+        q = str(query or "").strip().lower()
+        capped_limit = max(1, min(int(limit), 50))
+        params: list[object] = []
+        count_params: list[object] = []
+        where_sql = ""
+
+        if q:
+            like = f"%{q}%"
+            prefix = f"{q}%"
+            where_sql = (
+                "WHERE lower(name) LIKE ? "
+                "OR lower(coalesce(raw_name, '')) LIKE ? "
+                "OR lower(coalesce(class, '')) LIKE ? "
+                "OR lower(coalesce(source, '')) LIKE ? "
+                "OR lower(coalesce(chapter, '')) LIKE ? "
+                "OR lower(coalesce(instrument_variant, '')) LIKE ? "
+                "OR lower(coalesce(measure_mode, '')) LIKE ?"
+            )
+            count_params = [like, like, like, like, like, like, like]
+            params.extend(count_params)
+            params.extend([q, q, prefix, prefix, capped_limit])
+        else:
+            params.append(capped_limit)
+
+        sql = (
+            "SELECT id, name, raw_name, class, source, instrument_variant, measure_mode, chapter "
+            "FROM spectra_meta "
+            f"{where_sql} "
+        )
+        if q:
+            sql += (
+                "ORDER BY CASE "
+                "WHEN lower(name) = ? THEN 0 "
+                "WHEN lower(coalesce(raw_name, '')) = ? THEN 1 "
+                "WHEN lower(name) LIKE ? THEN 2 "
+                "WHEN lower(coalesce(class, '')) LIKE ? THEN 3 "
+                "ELSE 4 END, "
+                "name ASC "
+                "LIMIT ?"
+            )
+        else:
+            sql += "ORDER BY name ASC LIMIT ?"
+
+        count_sql = f"SELECT COUNT(*) FROM spectra_meta {where_sql}"
+        out: list[SpectrumMeta] = []
+        conn = sqlite3.connect(self.sqlite_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            total = int(conn.execute(count_sql, count_params).fetchone()[0])
+            rows = conn.execute(sql, params).fetchall()
+            for row in rows:
+                out.append(
+                    SpectrumMeta(
+                        spectrum_id=int(row["id"]),
+                        name=str(row["name"]),
+                        class_name=str(row["class"]) if row["class"] is not None else None,
+                        source=str(row["source"]) if row["source"] is not None else None,
+                        raw_name=str(row["raw_name"]) if row["raw_name"] is not None else None,
+                        instrument_variant=(
+                            str(row["instrument_variant"]) if row["instrument_variant"] is not None else None
+                        ),
+                        measure_mode=str(row["measure_mode"]) if row["measure_mode"] is not None else None,
+                        chapter=str(row["chapter"]) if row["chapter"] is not None else None,
+                    )
+                )
+        finally:
+            conn.close()
+        return total, out
+
+    def _search_metadata_from_h5(self, query: str, limit: int) -> tuple[int, list[SpectrumMeta]]:
+        q = str(query or "").strip().lower()
+        matched: list[SpectrumMeta] = []
+        meta_map = self._fetch_metadata_from_h5(
+            self._list_all_ids()[:]
+        )
+        for sid in sorted(meta_map):
+            meta = meta_map[sid]
+            haystack = " ".join(
+                part.lower()
+                for part in (
+                    meta.name,
+                    meta.class_name or "",
+                    meta.source or "",
+                    meta.chapter or "",
+                )
+                if part
+            )
+            if q and q not in haystack:
+                continue
+            matched.append(meta)
+        return len(matched), matched[: max(1, min(int(limit), 50))]
+
+    def to_display_summary(self, meta: SpectrumMeta) -> SpectrumMeta:
+        raw_name = meta.raw_name or meta.name
+        sensor_type = meta.instrument_variant
+        measure_mode = meta.measure_mode
+        if sensor_type is None or measure_mode is None:
+            parsed_sensor, parsed_mode = parse_variant_mode(raw_name)
+            sensor_type = sensor_type or parsed_sensor
+            measure_mode = measure_mode or parsed_mode
+        return SpectrumMeta(
+            spectrum_id=meta.spectrum_id,
+            name=normalize_display_name(meta.name),
+            class_name=meta.class_name,
+            source=meta.source,
+            raw_name=raw_name,
+            instrument_variant=sensor_type,
+            measure_mode=measure_mode,
+            chapter=meta.chapter,
+        )
+
+    def _load_id_row_index(self) -> dict[int, int]:
+        if self._id_row_index is not None:
+            return self._id_row_index
+        with h5py.File(self.h5_path, "r") as h5:
+            ids = h5["/meta/id"][:].astype(np.int32)
+        self._id_row_index = {int(sid): idx for idx, sid in enumerate(ids.tolist())}
+        return self._id_row_index
+
+    def _list_all_ids(self) -> list[int]:
+        with h5py.File(self.h5_path, "r") as h5:
+            return h5["/meta/id"][:].astype(np.int32).tolist()
 
     @staticmethod
     def _decode_vlen(value: bytes | str) -> str:

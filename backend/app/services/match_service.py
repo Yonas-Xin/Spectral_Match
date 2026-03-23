@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 
@@ -9,6 +8,7 @@ import numpy as np
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.models.schemas import (
+    LibraryCurveItem,
     MatchContextData,
     MatchResultItem,
     PixelMatchData,
@@ -21,9 +21,11 @@ from app.services.cache_service import SignatureCacheService
 from app.services.image_service import ImageService
 from app.services.library_service import LibraryService
 from app.services.state_store import ImageContext
+from app.utils.library_meta import normalize_display_name, parse_variant_mode
 from app.utils.signature import build_signature_hash
 from app.utils.spectral_math import (
     build_custom_range_mask,
+    build_valid_mask,
     merge_mask_ranges,
     normalize_vector,
     pearson_r,
@@ -48,27 +50,6 @@ class QuerySelectionResult:
     center_y: int
     mode: str
     pixel_count: int
-
-
-VARIANT_MODE_SUFFIX_RE = re.compile(
-    r"_(ASD(?:FR|HR|NG)[A-Za-z0-9]*|AVIRIS[A-Za-z0-9]*|BECK[A-Za-z0-9]*|NIC4[A-Za-z0-9]*)_(AREF|RREF|RTGC|TRAN)$",
-    flags=re.IGNORECASE,
-)
-
-
-def normalize_display_name(raw_name: str) -> str:
-    s = raw_name.strip()
-    if s.lower().startswith("splib07b_"):
-        s = s[9:]
-    s = VARIANT_MODE_SUFFIX_RE.sub("", s)
-    return s.replace("_", " ").strip() or raw_name
-
-
-def parse_variant_mode(raw_name: str) -> tuple[str | None, str | None]:
-    m = VARIANT_MODE_SUFFIX_RE.search(raw_name)
-    if not m:
-        return None, None
-    return m.group(1).upper(), m.group(2).upper()
 
 
 class MatchService:
@@ -131,18 +112,26 @@ class MatchService:
         )
 
     @staticmethod
-    def _clip_xy(ctx: ImageContext, x: float, y: float) -> tuple[int, int]:
-        ix = int(np.clip(int(round(x)), 0, ctx.samples - 1))
-        iy = int(np.clip(int(round(y)), 0, ctx.lines - 1))
-        return ix, iy
-
-    @staticmethod
     def _normalize_custom_mask_ranges(
         ranges: list[SpectralMaskRange] | None,
     ) -> list[tuple[float, float]]:
         if not ranges:
             return []
         return merge_mask_ranges([(float(r.start), float(r.end)) for r in ranges])
+
+    @staticmethod
+    def _normalize_candidate_spectrum_ids(spectrum_ids: list[int] | None) -> list[int]:
+        if not spectrum_ids:
+            return []
+        out: list[int] = []
+        seen: set[int] = set()
+        for sid in spectrum_ids:
+            value = int(sid)
+            if value <= 0 or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
 
     @staticmethod
     def _compute_nan_aware_sam_batch(
@@ -224,6 +213,12 @@ class MatchService:
             valid_mask=valid_mask,
             min_valid_bands=min_valid_bands,
         )
+
+    def _resolve_match_target(self, ctx: ImageContext) -> tuple[np.ndarray, np.ndarray | None]:
+        target_waves = ctx.wavelengths.astype(np.float32)
+        if settings.resample_algo_version.lower().startswith("linear"):
+            return target_waves, None
+        return target_waves, self.cache_service.resolve_target_fwhm(ctx.wavelengths, ctx.fwhm)
 
     def _mean_curve_from_pixels(
         self,
@@ -354,6 +349,96 @@ class MatchService:
 
         raise AppError(ErrorCode.INVALID_REQUEST, f"unsupported selection mode: {mode}", status_code=422)
 
+    def _build_match_result_items(
+        self,
+        spectrum_ids: np.ndarray,
+        curves: np.ndarray,
+        scores: np.ndarray,
+        query_clean: np.ndarray,
+        valid_mask: np.ndarray,
+        return_candidate_curves: bool,
+    ) -> list[MatchResultItem]:
+        ids = np.asarray(spectrum_ids, dtype=np.int64)
+        if ids.size == 0:
+            return []
+
+        meta_map = self.library_service.fetch_metadata(ids.astype(int).tolist())
+        results: list[MatchResultItem] = []
+        for rank, sid in enumerate(ids.tolist(), start=1):
+            curve = curves[rank - 1] if curves.size else np.array([], dtype=np.float32)
+            pearson = pearson_r(query_clean, curve, valid_mask=valid_mask) if curve.size else float("nan")
+            meta = meta_map.get(int(sid))
+            raw_name = meta.name if meta is not None else f"Spectrum {sid}"
+            raw_variant_name = meta.raw_name or raw_name if meta is not None else raw_name
+            sensor_type = meta.instrument_variant if meta is not None else None
+            measure_mode = meta.measure_mode if meta is not None else None
+            if sensor_type is None or measure_mode is None:
+                parsed_sensor, parsed_mode = parse_variant_mode(raw_variant_name)
+                sensor_type = sensor_type or parsed_sensor
+                measure_mode = measure_mode or parsed_mode
+
+            results.append(
+                MatchResultItem(
+                    rank=rank,
+                    spectrum_id=int(sid),
+                    name=normalize_display_name(raw_name),
+                    class_name=meta.class_name if meta is not None else None,
+                    sensor_type=sensor_type,
+                    measure_mode=measure_mode,
+                    source=meta.source if meta is not None else None,
+                    sam_score=float(scores[rank - 1]),
+                    pearson_r=float(pearson) if np.isfinite(pearson) else None,
+                    curve=curve.astype(float).tolist() if return_candidate_curves and curve.size else None,
+                )
+            )
+        return results
+
+    def _match_selected_spectra(
+        self,
+        ctx: ImageContext,
+        candidate_spectrum_ids: list[int],
+        query_clean: np.ndarray,
+        valid_mask: np.ndarray,
+        min_valid_bands: int,
+        top_n: int,
+        return_candidate_curves: bool,
+    ) -> tuple[int, list[MatchResultItem]]:
+        target_waves, target_fwhm = self._resolve_match_target(ctx)
+        curves_map = self.library_service.load_resampled_spectra(
+            ids=candidate_spectrum_ids,
+            target_waves=target_waves,
+            target_fwhm=target_fwhm,
+        )
+        ordered_ids = [sid for sid in candidate_spectrum_ids if sid in curves_map]
+        if not ordered_ids:
+            raise AppError(
+                ErrorCode.MATCH_FAILED,
+                "selected spectra could not be loaded from the library",
+                status_code=422,
+            )
+
+        candidate_curves = np.stack([curves_map[sid] for sid in ordered_ids], axis=0).astype(np.float32, copy=False)
+        sam_scores = self._compute_nan_aware_sam_batch(
+            batch=candidate_curves,
+            query_clean=query_clean,
+            valid_mask=valid_mask,
+            min_valid_bands=min_valid_bands,
+        )
+        order = np.argsort(sam_scores)
+        top_count = min(int(top_n), int(order.shape[0]))
+        top_idx = order[:top_count]
+        top_ids = np.asarray(ordered_ids, dtype=np.int64)[top_idx]
+        top_curves = candidate_curves[top_idx]
+        top_scores = sam_scores[top_idx]
+        return len(ordered_ids), self._build_match_result_items(
+            spectrum_ids=top_ids,
+            curves=top_curves,
+            scores=top_scores,
+            query_clean=query_clean,
+            valid_mask=valid_mask,
+            return_candidate_curves=return_candidate_curves,
+        )
+
     def match_pixel(
         self,
         image_id: str,
@@ -365,6 +450,7 @@ class MatchService:
         return_candidate_curves: bool,
         selection: RegionSelection | None = None,
         custom_masked_ranges: list[SpectralMaskRange] | None = None,
+        candidate_spectrum_ids: list[int] | None = None,
     ) -> PixelMatchData:
         started = time.perf_counter()
         ctx = self.image_service.store.get_image(image_id)
@@ -374,9 +460,77 @@ class MatchService:
                 f"image context not found: {image_id}",
                 status_code=404,
             )
+
         query_selection = self._extract_query_selection(ctx=ctx, x=x, y=y, selection=selection)
         query_spec = query_selection.spectrum
         prepared = self.prepare_signature(image_id=image_id, ignore_water_bands=ignore_water_bands, build_async=False)
+
+        normalized_custom_ranges = self._normalize_custom_mask_ranges(custom_masked_ranges)
+        self.image_service.store.set_image_mask_ranges(image_id, normalized_custom_ranges)
+        base_valid_mask = build_valid_mask(ctx.wavelengths, ignore_water_bands=ignore_water_bands)
+        dynamic_mask = build_custom_range_mask(ctx.wavelengths, normalized_custom_ranges)
+        valid_mask = base_valid_mask & dynamic_mask
+
+        query_scaled = scale_to_unit_reflectance(
+            query_spec,
+            scale_factor=ctx.reflectance_scale_factor,
+        )
+        query_clean = sanitize_reflectance(
+            query_scaled,
+            clip_min=settings.clip_reflectance_min,
+            clip_max=settings.clip_reflectance_max,
+        )
+        effective_min_valid_bands = int(
+            min_valid_bands if min_valid_bands is not None else settings.min_valid_bands
+        )
+        effective_min_valid_bands = max(1, min(effective_min_valid_bands, int(ctx.bands)))
+        bands_used_mask = valid_mask & np.isfinite(query_clean)
+        bands_used = int(np.count_nonzero(bands_used_mask))
+        if bands_used < effective_min_valid_bands:
+            raise AppError(
+                ErrorCode.MATCH_FAILED,
+                f"not enough valid bands: {bands_used} < {effective_min_valid_bands}",
+                status_code=422,
+            )
+
+        normalized_candidate_ids = self._normalize_candidate_spectrum_ids(candidate_spectrum_ids)
+        if normalized_candidate_ids:
+            candidate_count, results = self._match_selected_spectra(
+                ctx=ctx,
+                candidate_spectrum_ids=normalized_candidate_ids,
+                query_clean=query_clean,
+                valid_mask=valid_mask,
+                min_valid_bands=effective_min_valid_bands,
+                top_n=top_n,
+                return_candidate_curves=return_candidate_curves,
+            )
+            elapsed = int((time.perf_counter() - started) * 1000)
+            return PixelMatchData(
+                query=QuerySpectrumData(
+                    x=query_selection.center_x,
+                    y=query_selection.center_y,
+                    bands_total=ctx.bands,
+                    bands_used=bands_used,
+                    selection_mode=query_selection.mode,  # type: ignore[arg-type]
+                    selected_pixels=query_selection.pixel_count,
+                    wavelengths=ctx.wavelengths.astype(float).tolist(),
+                    spectrum=query_clean.astype(float).tolist(),
+                ),
+                match_context=MatchContextData(
+                    signature_hash=prepared.signature_hash,
+                    metric="sam",
+                    ignore_water_bands=ignore_water_bands,
+                    min_valid_bands=effective_min_valid_bands,
+                    custom_masked_ranges=[
+                        SpectralMaskRange(start=float(start), end=float(end))
+                        for start, end in normalized_custom_ranges
+                    ],
+                    candidate_count=candidate_count,
+                    elapsed_ms=elapsed,
+                ),
+                results=results,
+            )
+
         if prepared.status in {"not_found", "failed"}:
             self.cache_service.build_sync(
                 signature_hash=prepared.signature_hash,
@@ -406,33 +560,7 @@ class MatchService:
             )
 
         active = self.cache_service.load_active_signature(prepared.signature_hash)
-        base_valid_mask = active.valid_mask.astype(bool)
-        normalized_custom_ranges = self._normalize_custom_mask_ranges(custom_masked_ranges)
-        self.image_service.store.set_image_mask_ranges(image_id, normalized_custom_ranges)
-        dynamic_mask = build_custom_range_mask(ctx.wavelengths, normalized_custom_ranges)
-        valid_mask = base_valid_mask & dynamic_mask
-        query_scaled = scale_to_unit_reflectance(
-            query_spec,
-            scale_factor=ctx.reflectance_scale_factor,
-        )
-        query_clean = sanitize_reflectance(
-            query_scaled,
-            clip_min=settings.clip_reflectance_min,
-            clip_max=settings.clip_reflectance_max,
-        )
-        effective_min_valid_bands = int(
-            min_valid_bands if min_valid_bands is not None else settings.min_valid_bands
-        )
-        effective_min_valid_bands = max(1, min(effective_min_valid_bands, int(ctx.bands)))
-        bands_used_mask = valid_mask & np.isfinite(query_clean)
-        bands_used = int(np.count_nonzero(bands_used_mask))
-        if bands_used < effective_min_valid_bands:
-            raise AppError(
-                ErrorCode.MATCH_FAILED,
-                f"not enough valid bands: {bands_used} < {effective_min_valid_bands}",
-                status_code=422,
-            )
-
+        valid_mask = active.valid_mask.astype(bool) & dynamic_mask
         query_norm = normalize_vector(query_clean, valid_mask=valid_mask)
         total = int(active.spectra_norm.shape[0])
         candidate_idx: np.ndarray
@@ -487,42 +615,15 @@ class MatchService:
 
         row_indices = top_candidate_idx.astype(np.int64)
         top_curves = self.cache_service.load_resampled_rows(prepared.signature_hash, row_indices)
-        spectrum_ids = active.meta_ids[row_indices].astype(int)
-        meta_map = self.library_service.fetch_metadata(spectrum_ids.tolist())
-
-        results: list[MatchResultItem] = []
-        for rank, (row_idx, sid, sam_score) in enumerate(zip(row_indices, spectrum_ids, top_sam, strict=True), start=1):
-            curve = top_curves[rank - 1] if top_curves.size else np.array([], dtype=np.float32)
-            pearson = pearson_r(query_clean, curve, valid_mask=valid_mask) if curve.size else float("nan")
-            meta = meta_map.get(
-                int(sid),
-                None,
-            )
-            raw_name = meta.name if meta is not None else f"Spectrum {sid}"
-            sensor_type = meta.instrument_variant if meta is not None else None
-            measure_mode = meta.measure_mode if meta is not None else None
-            if sensor_type is None or measure_mode is None:
-                parsed_sensor, parsed_mode = parse_variant_mode(raw_name)
-                sensor_type = sensor_type or parsed_sensor
-                measure_mode = measure_mode or parsed_mode
-
-            name = normalize_display_name(raw_name)
-            class_name = meta.class_name if meta is not None else None
-            source = meta.source if meta is not None else None
-            results.append(
-                MatchResultItem(
-                    rank=rank,
-                    spectrum_id=int(sid),
-                    name=name,
-                    class_name=class_name,
-                    sensor_type=sensor_type,
-                    measure_mode=measure_mode,
-                    source=source,
-                    sam_score=float(sam_score),
-                    pearson_r=float(pearson) if np.isfinite(pearson) else None,
-                    curve=curve.astype(float).tolist() if return_candidate_curves and curve.size else None,
-                )
-            )
+        spectrum_ids = active.meta_ids[row_indices].astype(np.int64)
+        results = self._build_match_result_items(
+            spectrum_ids=spectrum_ids,
+            curves=top_curves,
+            scores=top_sam,
+            query_clean=query_clean,
+            valid_mask=valid_mask,
+            return_candidate_curves=return_candidate_curves,
+        )
 
         elapsed = int((time.perf_counter() - started) * 1000)
         return PixelMatchData(
@@ -550,6 +651,60 @@ class MatchService:
             ),
             results=results,
         )
+
+    def list_library_reference_curves(
+        self,
+        image_id: str,
+        spectrum_ids: list[int],
+    ) -> tuple[np.ndarray, list[LibraryCurveItem]]:
+        ctx = self.image_service.store.get_image(image_id)
+        if ctx is None:
+            raise AppError(
+                ErrorCode.IMAGE_CONTEXT_NOT_FOUND,
+                f"image context not found: {image_id}",
+                status_code=404,
+            )
+
+        normalized_ids = self._normalize_candidate_spectrum_ids(spectrum_ids)
+        if not normalized_ids:
+            return ctx.wavelengths.astype(np.float32), []
+
+        target_waves, target_fwhm = self._resolve_match_target(ctx)
+        curves_map = self.library_service.load_resampled_spectra(
+            ids=normalized_ids,
+            target_waves=target_waves,
+            target_fwhm=target_fwhm,
+        )
+        meta_map = self.library_service.fetch_metadata(normalized_ids)
+
+        items: list[LibraryCurveItem] = []
+        for sid in normalized_ids:
+            curve = curves_map.get(sid)
+            if curve is None:
+                continue
+            meta = meta_map.get(sid)
+            raw_name = meta.name if meta is not None else f"Spectrum {sid}"
+            raw_variant_name = meta.raw_name or raw_name if meta is not None else raw_name
+            sensor_type = meta.instrument_variant if meta is not None else None
+            measure_mode = meta.measure_mode if meta is not None else None
+            if sensor_type is None or measure_mode is None:
+                parsed_sensor, parsed_mode = parse_variant_mode(raw_variant_name)
+                sensor_type = sensor_type or parsed_sensor
+                measure_mode = measure_mode or parsed_mode
+            items.append(
+                LibraryCurveItem(
+                    spectrum_id=sid,
+                    name=normalize_display_name(raw_name),
+                    class_name=meta.class_name if meta is not None else None,
+                    sensor_type=sensor_type,
+                    measure_mode=measure_mode,
+                    source=meta.source if meta is not None else None,
+                    chapter=meta.chapter if meta is not None else None,
+                    wavelengths=target_waves.astype(float).tolist(),
+                    curve=curve.astype(float).tolist(),
+                )
+            )
+        return target_waves, items
 
     def extract_spectrum(self, image_id: str, x: int, y: int) -> tuple[np.ndarray, np.ndarray]:
         spectrum, ctx = self.image_service.extract_pixel_spectrum(image_id=image_id, x=x, y=y)

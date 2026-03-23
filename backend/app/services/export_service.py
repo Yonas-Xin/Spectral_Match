@@ -25,6 +25,7 @@ class ExportService:
         ignore_water_bands: bool,
         min_valid_bands: int | None = None,
         selection: RegionSelection | None = None,
+        candidate_spectrum_ids: list[int] | None = None,
     ) -> ExportData:
         result = self.match_service.match_pixel(
             image_id=image_id,
@@ -35,6 +36,7 @@ class ExportService:
             min_valid_bands=min_valid_bands,
             return_candidate_curves=include_matched_curves,
             selection=selection,
+            candidate_spectrum_ids=candidate_spectrum_ids,
         )
 
         out = Path(output_path).expanduser().resolve()

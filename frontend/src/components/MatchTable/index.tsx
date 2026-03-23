@@ -1,11 +1,18 @@
 import React from 'react'
-import { useAppStore } from '../../store/useAppStore'
+import { Check, Download } from 'lucide-react'
 import { useExportResultMutation } from '../../api/queries'
-import { Download, Check } from 'lucide-react'
+import { useAppStore } from '../../store/useAppStore'
 import './MatchTable.css'
 
 export const MatchTable: React.FC = () => {
-  const { matchData, imageId, selectedPixel, selection, matchOptions } = useAppStore()
+  const {
+    matchData,
+    imageId,
+    selectedPixel,
+    selection,
+    matchOptions,
+    selectedLibrarySpectra
+  } = useAppStore()
   const [format, setFormat] = React.useState('csv')
   const [outputPath, setOutputPath] = React.useState('')
   const [showSuccess, setShowSuccess] = React.useState(false)
@@ -18,13 +25,16 @@ export const MatchTable: React.FC = () => {
           <h3>Match Results</h3>
         </div>
         <div className="empty-state p-4">
-          No matches yet. Select a pixel to view top N results.
+          {selectedLibrarySpectra.length > 0
+            ? 'Reference spectra selected. Click a pixel in the image to rank them by similarity.'
+            : 'No matches yet. Select a pixel to view top N results.'}
         </div>
       </div>
     )
   }
 
   const { results, match_context } = matchData
+  const selectedSubsetActive = selectedLibrarySpectra.length > 0
   const canExport = !!imageId && !!selectedPixel && !!outputPath.trim()
 
   const handleExport = () => {
@@ -38,15 +48,16 @@ export const MatchTable: React.FC = () => {
         format,
         output_path: outputPath,
         include_query_spectrum: true,
-        include_matched_curves: true,
+        include_matched_curves: selectedLibrarySpectra.length === 0,
         ignore_water_bands: matchOptions.ignoreWaterBands,
         min_valid_bands: matchOptions.minValidBands,
-        selection: selection ?? undefined
+        selection: selection ?? undefined,
+        candidate_spectrum_ids: selectedLibrarySpectra.map((item) => item.spectrum_id)
       },
       {
         onSuccess: () => {
           setShowSuccess(true)
-          setTimeout(() => setShowSuccess(false), 2500)
+          window.setTimeout(() => setShowSuccess(false), 2500)
         }
       }
     )
@@ -55,9 +66,11 @@ export const MatchTable: React.FC = () => {
   return (
     <div className="match-table-container panel">
       <div className="panel-header">
-        <h3>Top {match_context.candidate_count > 0 ? results.length : 0} Matches</h3>
+        <h3>{selectedSubsetActive ? 'Selected Spectra Matches' : `Top ${results.length} Matches`}</h3>
         <span className="text-sm text-accent">
-          {match_context.metric.toUpperCase()} | {match_context.elapsed_ms}ms
+          {selectedSubsetActive
+            ? `${match_context.candidate_count} refs | ${match_context.elapsed_ms}ms`
+            : `${match_context.metric.toUpperCase()} | ${match_context.elapsed_ms}ms`}
         </span>
       </div>
 
@@ -77,7 +90,7 @@ export const MatchTable: React.FC = () => {
         </div>
         <button className="btn btn-secondary match-export-btn" onClick={handleExport} disabled={!canExport || exporting}>
           {showSuccess ? <Check size={14} className="text-success" /> : <Download size={14} />}
-          {exporting ? 'Exporting...' : showSuccess ? 'Exported' : 'Export Curves'}
+          {exporting ? 'Exporting...' : showSuccess ? 'Exported' : 'Export Result'}
         </button>
       </div>
 
@@ -93,8 +106,8 @@ export const MatchTable: React.FC = () => {
             </tr>
           </thead>
           <tbody>
-            {results.map((res: any) => (
-              <tr key={res.rank}>
+            {results.map((res) => (
+              <tr key={`${res.rank}-${res.spectrum_id}`}>
                 <td><span className="rank-badge">{res.rank}</span></td>
                 <td className="class-chip-cell">
                   <span className="class-chip">{res.class || 'Unknown'}</span>

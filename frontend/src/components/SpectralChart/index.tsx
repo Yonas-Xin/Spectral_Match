@@ -1,17 +1,27 @@
-import React, { useMemo } from 'react'
+import React from 'react'
 import ReactECharts from 'echarts-for-react'
-import { useAppStore } from '../../store/useAppStore'
+import { Brush, Eraser } from 'lucide-react'
 import { useMatchPixelMutation } from '../../api/queries'
 import { MATCH_CURVE_COLORS, TARGET_CURVE_COLOR } from '../../constants/spectralStyle'
-import { Brush, Eraser } from 'lucide-react'
+import { useAppStore } from '../../store/useAppStore'
+import type { LibraryCurveItem } from '../../types/spectral'
 import './SpectralChart.css'
 
 const MAX_TOOLTIP_CURVES = 6
+const TARGET_SERIES_NAME = 'Target Spectrum'
 const WATER_VAPOR_BANDS: Array<[number, number]> = [
   [1340, 1455],
   [1790, 1960],
   [2480, 2500]
 ]
+
+interface SpectralSeriesItem {
+  name: string
+  curve: number[]
+  wavelengths: number[]
+  color: string
+  dashed: boolean
+}
 
 export const SpectralChart: React.FC = () => {
   const chartRef = React.useRef<ReactECharts | null>(null)
@@ -21,6 +31,7 @@ export const SpectralChart: React.FC = () => {
   const dragMaskRangeRef = React.useRef<{ start: number; end: number } | null>(null)
   const {
     imageId,
+    imageMeta,
     selectedPixel,
     selection,
     selectionRevision,
@@ -28,19 +39,39 @@ export const SpectralChart: React.FC = () => {
     status,
     setMatchData,
     matchData,
+    selectedLibrarySpectra,
+    selectedLibraryCurves,
     setStatus
   } = useAppStore()
   const { mutate: matchPixel, isPending } = useMatchPixelMutation()
   const { topN, metric, minValidBands, ignoreWaterBands, showWaterBandRanges, customMaskedRanges } = matchOptions
   const { setMatchOptions } = useAppStore()
+
+  const baseWaves = React.useMemo(() => {
+    if (Array.isArray(matchData?.query?.wavelengths) && matchData.query.wavelengths.length > 1) {
+      return matchData.query.wavelengths
+    }
+    if (Array.isArray(imageMeta?.wavelengths) && imageMeta.wavelengths.length > 1) {
+      return imageMeta.wavelengths as number[]
+    }
+    if (selectedLibraryCurves[0]?.wavelengths?.length) {
+      return selectedLibraryCurves[0].wavelengths
+    }
+    return null
+  }, [imageMeta?.wavelengths, matchData, selectedLibraryCurves])
+
   const waveBounds = React.useMemo(() => {
-    const waves = matchData?.query?.wavelengths
-    if (!Array.isArray(waves) || waves.length < 2) return null
-    const min = Number(waves[0])
-    const max = Number(waves[waves.length - 1])
+    if (!baseWaves || baseWaves.length < 2) return null
+    const min = Number(baseWaves[0])
+    const max = Number(baseWaves[baseWaves.length - 1])
     if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return null
     return { min, max }
-  }, [matchData])
+  }, [baseWaves])
+
+  const selectedSpectrumIds = React.useMemo(
+    () => selectedLibrarySpectra.map((item) => item.spectrum_id),
+    [selectedLibrarySpectra]
+  )
 
   const mergeRanges = React.useCallback((ranges: Array<{ start: number; end: number }>) => {
     if (ranges.length === 0) return []
@@ -92,12 +123,12 @@ export const SpectralChart: React.FC = () => {
     [mergeRanges]
   )
 
-  // Auto-trigger match when pixel changes
   React.useEffect(() => {
     if (!imageId || !selectedPixel) return
     if (status === 'loading_image') return
 
-      matchPixel({
+    matchPixel(
+      {
         image_id: imageId,
         x: selectedPixel.x,
         y: selectedPixel.y,
@@ -105,11 +136,13 @@ export const SpectralChart: React.FC = () => {
         metric,
         ignore_water_bands: ignoreWaterBands,
         min_valid_bands: minValidBands,
-        return_candidate_curves: true,
+        return_candidate_curves: selectedSpectrumIds.length === 0,
         selection: selection ?? { mode: 'pixel', x: selectedPixel.x, y: selectedPixel.y },
-        custom_masked_ranges: customMaskedRanges
-      }, {
-        onSuccess: (data: any) => {
+        custom_masked_ranges: customMaskedRanges,
+        candidate_spectrum_ids: selectedSpectrumIds
+      },
+      {
+        onSuccess: (data) => {
           setMatchData(data)
           setStatus('ready')
         },
@@ -121,8 +154,24 @@ export const SpectralChart: React.FC = () => {
           }
           setStatus('error', message || 'Match failed')
         }
-      })
-  }, [imageId, selectedPixel, selection, selectionRevision, topN, metric, minValidBands, ignoreWaterBands, customMaskedRanges, status, setMatchData, setStatus])
+      }
+    )
+  }, [
+    imageId,
+    selectedPixel,
+    selection,
+    selectionRevision,
+    topN,
+    metric,
+    minValidBands,
+    ignoreWaterBands,
+    customMaskedRanges,
+    status,
+    selectedSpectrumIds,
+    setMatchData,
+    setStatus,
+    matchPixel
+  ])
 
   React.useEffect(() => {
     if (!isMaskDrawMode) {
@@ -132,19 +181,19 @@ export const SpectralChart: React.FC = () => {
     }
   }, [isMaskDrawMode])
 
-  const chartOptions = useMemo(() => {
-    if (!matchData) {
+  const chartOptions = React.useMemo(() => {
+    if (!baseWaves || baseWaves.length < 2) {
       return {
         title: {
           text: 'No Data',
           left: 'center',
+          top: 'middle',
           textStyle: { color: '#94a3b8' }
         }
       }
     }
 
-    const { query, results } = matchData
-    const waves = query.wavelengths
+    const waves = baseWaves
     const waveMin = Number(waves[0])
     const waveMax = Number(waves[waves.length - 1])
     const waterBandAreas = WATER_VAPOR_BANDS
@@ -176,57 +225,36 @@ export const SpectralChart: React.FC = () => {
       ...customMaskedRanges
     ])
 
-    const pairSeries = (values: number[]) =>
-      waves.map((w: number, i: number) => {
+    const pairSeries = (seriesWaves: number[], values: number[]) =>
+      seriesWaves.map((w, i) => {
         const v = values[i]
         const masked = effectiveMaskedRanges.some(({ start, end }) => Number(w) >= start && Number(w) <= end)
         if (masked) return [w, null]
         return [w, v ?? null]
       })
 
-    // Base target spectrum
-    const seriesData: any[] = [
-      {
-        name: 'Target Pixel',
-        type: 'line',
-        data: pairSeries(query.spectrum),
-        lineStyle: { width: 3, color: TARGET_CURVE_COLOR },
-        symbol: 'none',
-        showSymbol: false,
-        z: 10,
-        markArea: showWaterBandRanges
-          ? {
-              silent: true,
-              itemStyle: {
-                color: 'rgba(14, 116, 144, 0.12)'
-              },
-              label: {
-                show: false
-              },
-              data: waterBandAreas
-            }
-          : undefined
-      }
-    ]
+    const referenceCurves: SpectralSeriesItem[] = selectedLibraryCurves.length > 0
+      ? selectedLibraryCurves.map((item: LibraryCurveItem, idx: number) => ({
+          name: item.name,
+          curve: item.curve,
+          wavelengths: item.wavelengths,
+          color: MATCH_CURVE_COLORS[idx % MATCH_CURVE_COLORS.length],
+          dashed: false
+        }))
+      : (matchData?.results ?? [])
+          .filter((item) => Array.isArray(item.curve) && item.curve.length > 0)
+          .map((item, idx) => ({
+            name: `${item.rank}. ${item.name}`,
+            curve: item.curve ?? [],
+            wavelengths: waves,
+            color: MATCH_CURVE_COLORS[idx % MATCH_CURVE_COLORS.length],
+            dashed: true
+          }))
 
-    // Matched spectra
-    results.forEach((res: any, idx: number) => {
-      if (res.curve) {
-        seriesData.push({
-          name: `${res.rank}. ${res.name}`,
-          type: 'line',
-          data: pairSeries(res.curve),
-          lineStyle: { width: 1.5, type: 'dashed' as const },
-          itemStyle: { color: MATCH_CURVE_COLORS[idx % MATCH_CURVE_COLORS.length] },
-          symbol: 'none',
-          showSymbol: false,
-          z: 5 - idx
-        })
-      }
-    })
+    const seriesData: any[] = []
 
     if (customBandAreas.length > 0) {
-      seriesData.unshift({
+      seriesData.push({
         name: '__custom_mask__',
         type: 'line',
         data: [],
@@ -244,6 +272,62 @@ export const SpectralChart: React.FC = () => {
         }
       })
     }
+
+    if (matchData?.query?.spectrum) {
+      seriesData.push({
+        name: TARGET_SERIES_NAME,
+        type: 'line',
+        data: pairSeries(matchData.query.wavelengths, matchData.query.spectrum),
+        lineStyle: { width: 3, color: TARGET_CURVE_COLOR },
+        itemStyle: { color: TARGET_CURVE_COLOR },
+        symbol: 'none',
+        showSymbol: false,
+        z: 12,
+        markArea: showWaterBandRanges
+          ? {
+              silent: true,
+              itemStyle: {
+                color: 'rgba(14, 116, 144, 0.12)'
+              },
+              label: {
+                show: false
+              },
+              data: waterBandAreas
+            }
+          : undefined
+      })
+    } else if (showWaterBandRanges && waterBandAreas.length > 0) {
+      seriesData.push({
+        name: '__water_mask__',
+        type: 'line',
+        data: [],
+        silent: true,
+        showSymbol: false,
+        lineStyle: { opacity: 0 },
+        tooltip: { show: false },
+        markArea: {
+          silent: true,
+          itemStyle: {
+            color: 'rgba(14, 116, 144, 0.12)'
+          },
+          label: { show: false },
+          data: waterBandAreas
+        }
+      })
+    }
+
+    referenceCurves.forEach((item, idx) => {
+      seriesData.push({
+        name: item.name,
+        type: 'line',
+        data: pairSeries(item.wavelengths, item.curve),
+        lineStyle: { width: item.dashed ? 1.5 : 2, type: item.dashed ? 'dashed' : 'solid' },
+        itemStyle: { color: item.color },
+        symbol: 'none',
+        showSymbol: false,
+        z: 8 - idx
+      })
+    })
 
     const allYValues = seriesData.flatMap((series) =>
       (series.data as Array<[number, number | null]>)
@@ -271,6 +355,7 @@ export const SpectralChart: React.FC = () => {
     if (yMaxAxis <= yMinAxis) {
       yMaxAxis = yMinAxis + 0.1
     }
+
     const xLabelFormatter = (value: number) => {
       const n = Number(value)
       if (!Number.isFinite(n)) return ''
@@ -280,33 +365,29 @@ export const SpectralChart: React.FC = () => {
       return `${nearest500}`
     }
 
-    const getSeriesRank = (seriesName: string): number => {
-      if (seriesName === 'Target Pixel') return -1
-      const m = /^(\d+)\./.exec(seriesName)
-      return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER
-    }
-
     const tooltipFormatter = (params: any) => {
-      const items = Array.isArray(params) ? params : [params]
+      const items = (Array.isArray(params) ? params : [params]).filter(
+        (item: any) => item?.seriesName && !String(item.seriesName).startsWith('__')
+      )
       if (items.length === 0) return ''
 
       const wavelength = Number(items[0]?.axisValue)
-      const target = items.find((it: any) => it.seriesName === 'Target Pixel')
+      const target = items.find((item: any) => item.seriesName === TARGET_SERIES_NAME)
       const others = items
-        .filter((it: any) => it.seriesName !== 'Target Pixel')
-        .sort((a: any, b: any) => getSeriesRank(String(a.seriesName)) - getSeriesRank(String(b.seriesName)))
+        .filter((item: any) => item.seriesName !== TARGET_SERIES_NAME)
+        .sort((a: any, b: any) => Number(a.seriesIndex) - Number(b.seriesIndex))
       const ordered = [target, ...others].filter(Boolean)
       const visible = ordered.slice(0, MAX_TOOLTIP_CURVES)
       const hiddenCount = Math.max(0, ordered.length - visible.length)
 
       const rows = visible
-        .map((it: any) => {
-          const point = Array.isArray(it.value) ? it.value[1] : it.value
+        .map((item: any) => {
+          const point = Array.isArray(item.value) ? item.value[1] : item.value
           const numeric = typeof point === 'number' ? point : Number(point)
           const valueText = Number.isFinite(numeric) ? numeric.toFixed(4) : '-'
           return (
             `<div class="spectral-tooltip-row">` +
-              `<span class="spectral-tooltip-name">${it.marker}${it.seriesName}</span>` +
+              `<span class="spectral-tooltip-name">${item.marker}${item.seriesName}</span>` +
               `<span class="spectral-tooltip-value">${valueText}</span>` +
             `</div>`
           )
@@ -352,7 +433,7 @@ export const SpectralChart: React.FC = () => {
         max: waves[waves.length - 1],
         axisPointer: {
           label: {
-            formatter: ({ value }: any) => {
+            formatter: ({ value }: { value: number }) => {
               const n = Number(value)
               return Number.isFinite(n) ? n.toFixed(2) : ''
             }
@@ -372,7 +453,7 @@ export const SpectralChart: React.FC = () => {
         max: yMaxAxis,
         axisPointer: {
           label: {
-            formatter: ({ value }: any) => {
+            formatter: ({ value }: { value: number }) => {
               const n = Number(value)
               return Number.isFinite(n) ? n.toFixed(4) : ''
             }
@@ -400,7 +481,17 @@ export const SpectralChart: React.FC = () => {
       series: seriesData,
       backgroundColor: 'transparent'
     }
-  }, [matchData, ignoreWaterBands, showWaterBandRanges, customMaskedRanges, dragMaskRange, mergeRanges, subtractRanges])
+  }, [
+    baseWaves,
+    customMaskedRanges,
+    dragMaskRange,
+    ignoreWaterBands,
+    matchData,
+    mergeRanges,
+    selectedLibraryCurves,
+    showWaterBandRanges,
+    subtractRanges
+  ])
 
   const clientToWave = React.useCallback((clientX: number, _clientY: number): number | null => {
     const inst = chartRef.current?.getEchartsInstance()
@@ -543,20 +634,35 @@ export const SpectralChart: React.FC = () => {
     }
   }, [isMaskDrawMode, finalizeOverlayDrag])
 
-  const legendItems = useMemo(() => {
-    if (!matchData?.results) return []
-    return [
-      { key: 'target', color: TARGET_CURVE_COLOR, label: 'Target Pixel', dashed: false },
-      ...matchData.results
-        .filter((res: any) => Array.isArray(res.curve) && res.curve.length > 0)
-        .map((res: any, idx: number) => ({
-          key: `match-${res.rank}`,
+  const legendItems = React.useMemo(() => {
+    const items: Array<{ key: string; color: string; label: string; dashed: boolean }> = []
+    if (matchData?.query?.spectrum) {
+      items.push({ key: 'target', color: TARGET_CURVE_COLOR, label: TARGET_SERIES_NAME, dashed: false })
+    }
+    if (selectedLibraryCurves.length > 0) {
+      items.push(
+        ...selectedLibraryCurves.map((item, idx) => ({
+          key: `library-${item.spectrum_id}`,
           color: MATCH_CURVE_COLORS[idx % MATCH_CURVE_COLORS.length],
-          label: `${res.rank}. ${res.name}`,
+          label: item.name,
+          dashed: false
+        }))
+      )
+      return items
+    }
+    if (!matchData?.results) return items
+    items.push(
+      ...matchData.results
+        .filter((item) => Array.isArray(item.curve) && item.curve.length > 0)
+        .map((item, idx) => ({
+          key: `match-${item.rank}`,
+          color: MATCH_CURVE_COLORS[idx % MATCH_CURVE_COLORS.length],
+          label: `${item.rank}. ${item.name}`,
           dashed: true
         }))
-    ]
-  }, [matchData])
+    )
+    return items
+  }, [matchData, selectedLibraryCurves])
 
   return (
     <div className="spectral-chart-container panel">
@@ -583,7 +689,9 @@ export const SpectralChart: React.FC = () => {
           >
             <Eraser size={14} />
           </button>
-          {isPending && <span className="text-accent text-sm ml-2">Matching...</span>}
+          <span className="text-accent text-sm">
+            {isPending ? 'Matching...' : selectedLibraryCurves.length > 0 ? `${selectedLibraryCurves.length} refs` : ''}
+          </span>
         </div>
       </div>
       <div className="chart-wrapper">
@@ -611,13 +719,13 @@ export const SpectralChart: React.FC = () => {
         </div>
         <div className="chart-side-legend" aria-label="Curve legend">
           {legendItems.length === 0 ? (
-            <div className="chart-legend-empty">Select a pixel to show legend.</div>
+            <div className="chart-legend-empty">Select library spectra or click the image to show curves.</div>
           ) : (
-            legendItems.map((item: any) => (
+            legendItems.map((item) => (
               <div className="chart-legend-item" key={item.key} title={item.label}>
                 <span
                   className={`chart-legend-line ${item.dashed ? 'is-dashed' : ''}`}
-                  style={{ ['--legend-color' as any]: item.color }}
+                  style={{ '--legend-color': item.color } as React.CSSProperties}
                 />
                 <span className="chart-legend-label">{item.label}</span>
               </div>

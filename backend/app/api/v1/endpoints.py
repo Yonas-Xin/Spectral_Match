@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse
 
 from app.core.config import settings
@@ -12,13 +12,17 @@ from app.models.schemas import (
     ImageLoadData,
     ImageLoadRequest,
     ImageMetaData,
+    LibraryCurvesData,
+    LibraryCurvesRequest,
+    LibrarySearchData,
+    LibrarySpectrumSummary,
     PixelMatchData,
     PixelMatchRequest,
     SignatureStatusData,
     SpectrumExtractData,
     SpectrumExtractRequest,
 )
-from app.services.container import cache_service, export_service, image_service, match_service, store
+from app.services.container import cache_service, export_service, image_service, library_service, match_service, store
 
 router = APIRouter()
 
@@ -84,6 +88,7 @@ def match_pixel(req: PixelMatchRequest) -> ApiResponse[PixelMatchData]:
         return_candidate_curves=req.return_candidate_curves,
         selection=req.selection,
         custom_masked_ranges=req.custom_masked_ranges,
+        candidate_spectrum_ids=req.candidate_spectrum_ids,
     )
     return ApiResponse(code=0, message="ok", data=data)
 
@@ -114,8 +119,57 @@ def export_match_result(req: ExportMatchResultRequest) -> ApiResponse[ExportData
         ignore_water_bands=req.ignore_water_bands,
         min_valid_bands=req.min_valid_bands,
         selection=req.selection,
+        candidate_spectrum_ids=req.candidate_spectrum_ids,
     )
     return ApiResponse(code=0, message="ok", data=data)
+
+
+@router.get("/library/search", response_model=ApiResponse[LibrarySearchData])
+def search_library(
+    q: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> ApiResponse[LibrarySearchData]:
+    total, rows = library_service.search_metadata(query=q, limit=limit)
+    items = []
+    for meta in rows:
+        display = library_service.to_display_summary(meta)
+        items.append(
+            LibrarySpectrumSummary(
+                spectrum_id=display.spectrum_id,
+                name=display.name,
+                class_name=display.class_name,
+                sensor_type=display.instrument_variant,
+                measure_mode=display.measure_mode,
+                source=display.source,
+                chapter=display.chapter,
+            )
+        )
+    return ApiResponse(
+        code=0,
+        message="ok",
+        data=LibrarySearchData(
+            query=q,
+            total=total,
+            items=items,
+        ),
+    )
+
+
+@router.post("/library/curves", response_model=ApiResponse[LibraryCurvesData])
+def get_library_curves(req: LibraryCurvesRequest) -> ApiResponse[LibraryCurvesData]:
+    wavelengths, items = match_service.list_library_reference_curves(
+        image_id=req.image_id,
+        spectrum_ids=req.spectrum_ids,
+    )
+    return ApiResponse(
+        code=0,
+        message="ok",
+        data=LibraryCurvesData(
+            image_id=req.image_id,
+            wavelengths=wavelengths.astype(float).tolist(),
+            items=items,
+        ),
+    )
 
 
 @router.get("/image/{image_id}/meta", response_model=ApiResponse[ImageMetaData])
