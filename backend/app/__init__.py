@@ -1,1 +1,0 @@
-"""Spectral Match backend package."""
